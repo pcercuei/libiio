@@ -24,6 +24,7 @@
 
 static void iiod_io_ref_unlocked(struct iiod_io *io);
 static void iiod_io_unref_unlocked(struct iiod_io *io);
+static int iiod_io_cond_wait(const struct iiod_io *io, uint64_t start_time);
 
 struct iiod_client_data {
 	/*
@@ -52,6 +53,9 @@ struct iiod_io {
 
 	/* Set to true when the response has been read */
 	bool r_done;
+
+	/* Set to true when a response request was enqueued */
+	bool r_enqueued;
 
 	/* Reference counter */
 	unsigned int refcnt;
@@ -369,11 +373,26 @@ static int iiod_enqueue_command(struct iiod_io *writer, uint8_t op,
 				const struct iiod_buf *buf, size_t nb)
 {
 	struct iiod_responder *priv = writer->responder;
+	struct iio_task_token *token;
+	uint64_t start_time;
+	int err;
 
 	if (nb > NB_BUFS_MAX)
 		return -EINVAL;
 
-	writer->w_io.start_time = read_counter_us();
+	start_time = read_counter_us();
+
+	iio_mutex_lock(writer->lock);
+
+	while (writer->write_token) {
+		err = iiod_io_cond_wait(writer, start_time);
+		if (err) {
+			iio_mutex_unlock(writer->lock);
+			return err;
+		}
+	}
+
+	writer->w_io.start_time = start_time;
 	writer->w_io.cmd.op = op;
 	writer->w_io.cmd.dev = dev;
 	writer->w_io.cmd.client_id = writer->client_id;
@@ -382,19 +401,21 @@ static int iiod_enqueue_command(struct iiod_io *writer, uint8_t op,
 		memcpy(writer->w_io.buf, buf, sizeof(*buf) * nb);
 	writer->w_io.nb_buf = nb;
 
-	if (writer->write_token)
-	      return -EIO;
-
 	iio_mutex_lock(priv->lock);
 	if (priv->thrd_stop) {
 		iio_mutex_unlock(priv->lock);
+		iio_mutex_unlock(writer->lock);
 		return priv->thrd_err_code;
 	}
 
-	writer->write_token = iio_task_enqueue(priv->write_task, writer);
-	iio_mutex_unlock(priv->lock);
+	token = iio_task_enqueue(priv->write_task, writer);
+	if (!iio_err(token))
+		writer->write_token = token;
 
-	return iio_err(writer->write_token);
+	iio_mutex_unlock(priv->lock);
+	iio_mutex_unlock(writer->lock);
+
+	return iio_err(token);
 }
 
 bool iiod_io_command_is_done(struct iiod_io *io)
@@ -425,6 +446,7 @@ int iiod_io_wait_for_command_done(struct iiod_io *io)
 	iio_mutex_lock(io->lock);
 	token = io->write_token;
 	io->write_token = NULL;
+	iio_cond_signal(io->cond);
 	iio_mutex_unlock(io->lock);
 
 	if (!token)
@@ -455,14 +477,14 @@ bool iiod_io_has_response(struct iiod_io *io)
 	return read_counter_us() - io->w_io.start_time > timeout_us;
 }
 
-static int iiod_io_cond_wait(const struct iiod_io *io)
+static int iiod_io_cond_wait(const struct iiod_io *io, uint64_t start_time)
 {
 	uint64_t diff_ms, timeout_ms = io->timeout_ms;
 
 	if (!timeout_ms)
 		return iio_cond_wait(io->cond, io->lock, 0);
 
-	diff_ms = (read_counter_us() - io->r_io.start_time) / 1000;
+	diff_ms = (read_counter_us() - start_time) / 1000;
 
 	if (diff_ms < timeout_ms) {
 		return iio_cond_wait(io->cond, io->lock,
@@ -476,11 +498,12 @@ int32_t iiod_io_wait_for_response(struct iiod_io *io)
 {
 	struct iiod_responder *priv = io->responder;
 	int ret = 0;
+	int32_t resp = 0;
 
 	iio_mutex_lock(io->lock);
 
 	while (!io->r_done) {
-		ret = iiod_io_cond_wait(io);
+		ret = iiod_io_cond_wait(io, io->r_io.start_time);
 		if (ret) {
 			iio_mutex_lock(priv->lock);
 			__iiod_io_cancel_unlocked(io);
@@ -492,9 +515,13 @@ int32_t iiod_io_wait_for_response(struct iiod_io *io)
 		}
 	}
 
+	resp = io->r_io.cmd.code;
+	io->r_enqueued = false;
+	iio_cond_signal(io->cond);
+
 	iio_mutex_unlock(io->lock);
 
-	return io->r_io.cmd.code;
+	return resp;
 }
 
 void iiod_io_cancel_response(struct iiod_io *io)
@@ -546,14 +573,29 @@ int iiod_io_get_response_async(struct iiod_io *io,
 {
 	struct iiod_responder *priv = io->responder;
 	struct iiod_io *tmp;
+	uint64_t start_time;
+	int err;
 
 	if (nb > NB_BUFS_MAX)
 		return -EINVAL;
+
+	start_time = read_counter_us();
+
+	iio_mutex_lock(io->lock);
+
+	while (io->r_enqueued) {
+		err = iiod_io_cond_wait(io, start_time);
+		if (err) {
+			iio_mutex_unlock(io->lock);
+			return err;
+		}
+	}
 
 	iio_mutex_lock(priv->lock);
 	if (priv->thrd_stop) {
 		/* Thread has been stopped, cannot enqueue response */
 		iio_mutex_unlock(priv->lock);
+		iio_mutex_unlock(io->lock);
 		return priv->thrd_err_code;
 	}
 
@@ -561,6 +603,7 @@ int iiod_io_get_response_async(struct iiod_io *io,
 		memcpy(io->r_io.buf, buf, sizeof(*buf) * nb);
 	io->r_io.nb_buf = nb;
 	io->r_done = false;
+	io->r_enqueued = true;
 	io->r_next = NULL;
 	io->r_io.start_time = read_counter_us();
 
@@ -574,6 +617,7 @@ int iiod_io_get_response_async(struct iiod_io *io,
 	}
 
 	iio_mutex_unlock(priv->lock);
+	iio_mutex_unlock(io->lock);
 
 	return 0;
 }

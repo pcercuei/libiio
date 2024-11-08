@@ -101,7 +101,7 @@ int iio_cond_wait(struct iio_cond *cond, struct iio_mutex *lock,
 
 void iio_cond_signal(struct iio_cond *cond)
 {
-	pthread_cond_signal(&cond->cond);
+	pthread_cond_broadcast(&cond->cond);
 }
 
 static void * iio_thrd_wrapper(void *d)
